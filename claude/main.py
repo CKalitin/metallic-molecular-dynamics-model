@@ -396,7 +396,7 @@ class MDCanvas:
         )
         self.view = self.canvas.central_widget.add_view()
         self.view.camera = scene.cameras.TurntableCamera(
-            distance=box_size * 1.8, fov=45
+            distance=box_size * 1.8, fov=70, translate_speed=10.0
         )
 
         # 2) Create ModernGL context from VisPy's active GL context
@@ -419,9 +419,9 @@ class MDCanvas:
             np.array([0.25, 0.25, 0.25, 1.0]),
         )
 
-        self.scatter = visuals.Markers()
+        self.scatter = visuals.Markers(scaling=True)
         self.scatter.set_data(
-            init_pos[:, :3], face_color=colors, size=7, edge_width=0
+            init_pos[:, :3], face_color=colors, size=1.0, edge_width=0
         )
         self.view.add(self.scatter)
 
@@ -447,23 +447,20 @@ class MDCanvas:
         self.timer = app.Timer(interval=0.001, connect=self.on_timer, start=True)
 
     def on_timer(self, event):
-        steps_per_frame = 5
-        for _ in range(steps_per_frame):
-            step(self.gpu)
-            self.step_count += 1
+        step(self.gpu)
+        self.step_count += 1
 
         pos = read_positions(self.gpu)[:, :3]
-        self.scatter.set_data(pos, face_color=self.colors, size=7, edge_width=0)
+        self.scatter.set_data(pos, face_color=self.colors, size=0.8, edge_width=0)
 
-        # Velocity-rescaling thermostat every frame (every 5 steps)
+        # Velocity-rescaling thermostat every step
         vel = read_velocities(self.gpu)
         temp = compute_temperature(vel, self.types)
         if np.isfinite(temp) and temp > 1.0:
             scale = float(np.sqrt(TARGET_TEMP / temp))
             vel[:, :3] = (vel[:, :3] * scale).astype(np.float32)
             self.gpu["buf_vel_cur"].write(vel.tobytes())
-        if self.step_count % 500 < steps_per_frame:
-            print(f"Step {self.step_count:>6d}  |  T = {temp:8.2f} K")
+        print(f"Step {self.step_count:>6d}  |  T = {temp:8.2f} K")
 
         self.canvas.update()
 
