@@ -1,0 +1,5 @@
+numpy
+moderngl
+vispy
+PyOpenGL
+PyQt6
