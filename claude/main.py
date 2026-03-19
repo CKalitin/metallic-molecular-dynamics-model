@@ -382,6 +382,121 @@ def read_velocities(gpu) -> np.ndarray:
     return np.frombuffer(raw, dtype=np.float32).reshape(gpu["n_atoms"], 4).copy()
 
 # ---------------------------------------------------------------------------
+# Density heat-map utilities
+# ---------------------------------------------------------------------------
+def smooth_periodic_density(field: np.ndarray, passes: int = 2) -> np.ndarray:
+    """Apply light periodic smoothing with a separable [1,2,1] kernel."""
+    smoothed = field.astype(np.float32, copy=True)
+    for _ in range(passes):
+        for axis in range(3):
+            smoothed = (
+                np.roll(smoothed, 1, axis=axis)
+                + 2.0 * smoothed
+                + np.roll(smoothed, -1, axis=axis)
+            ) * 0.25
+    return smoothed
+
+
+def compute_density_samples(positions: np.ndarray, box_size: float,
+                            grid_size: int) -> np.ndarray:
+    """
+    Estimate local number density at each particle position.
+    Uses periodic cloud-in-cell deposition onto a 3D grid, smoothing,
+    then trilinear sampling back to atom coordinates.
+    """
+    g = int(grid_size)
+    pos = np.mod(positions, box_size).astype(np.float32)
+    scaled = pos * (g / box_size)
+    base = np.floor(scaled).astype(np.int32)
+    frac = scaled - base
+
+    ix0 = base[:, 0] % g
+    iy0 = base[:, 1] % g
+    iz0 = base[:, 2] % g
+    ix1 = (ix0 + 1) % g
+    iy1 = (iy0 + 1) % g
+    iz1 = (iz0 + 1) % g
+
+    wx1 = frac[:, 0]
+    wy1 = frac[:, 1]
+    wz1 = frac[:, 2]
+    wx0 = 1.0 - wx1
+    wy0 = 1.0 - wy1
+    wz0 = 1.0 - wz1
+
+    field = np.zeros((g, g, g), dtype=np.float32)
+
+    # Cloud-in-cell deposition spreads each atom across 8 neighboring voxels.
+    np.add.at(field, (ix0, iy0, iz0), wx0 * wy0 * wz0)
+    np.add.at(field, (ix1, iy0, iz0), wx1 * wy0 * wz0)
+    np.add.at(field, (ix0, iy1, iz0), wx0 * wy1 * wz0)
+    np.add.at(field, (ix0, iy0, iz1), wx0 * wy0 * wz1)
+    np.add.at(field, (ix1, iy1, iz0), wx1 * wy1 * wz0)
+    np.add.at(field, (ix1, iy0, iz1), wx1 * wy0 * wz1)
+    np.add.at(field, (ix0, iy1, iz1), wx0 * wy1 * wz1)
+    np.add.at(field, (ix1, iy1, iz1), wx1 * wy1 * wz1)
+
+    voxel_volume = (box_size / g) ** 3
+    field /= voxel_volume
+    field = smooth_periodic_density(field, passes=2)
+
+    c000 = field[ix0, iy0, iz0]
+    c100 = field[ix1, iy0, iz0]
+    c010 = field[ix0, iy1, iz0]
+    c001 = field[ix0, iy0, iz1]
+    c110 = field[ix1, iy1, iz0]
+    c101 = field[ix1, iy0, iz1]
+    c011 = field[ix0, iy1, iz1]
+    c111 = field[ix1, iy1, iz1]
+
+    density = (
+        c000 * wx0 * wy0 * wz0
+        + c100 * wx1 * wy0 * wz0
+        + c010 * wx0 * wy1 * wz0
+        + c001 * wx0 * wy0 * wz1
+        + c110 * wx1 * wy1 * wz0
+        + c101 * wx1 * wy0 * wz1
+        + c011 * wx0 * wy1 * wz1
+        + c111 * wx1 * wy1 * wz1
+    )
+    return density.astype(np.float32)
+
+
+def heat_colormap(t: np.ndarray) -> np.ndarray:
+    """Map normalized values to a vivid blue→cyan→amber→red palette."""
+    stops = np.array([0.0, 0.25, 0.55, 0.8, 1.0], dtype=np.float32)
+    palette = np.array([
+        [0.04, 0.10, 0.30],
+        [0.08, 0.55, 0.92],
+        [0.95, 0.93, 0.30],
+        [0.96, 0.48, 0.14],
+        [0.82, 0.08, 0.06],
+    ], dtype=np.float32)
+
+    r = np.interp(t, stops, palette[:, 0])
+    g = np.interp(t, stops, palette[:, 1])
+    b = np.interp(t, stops, palette[:, 2])
+    return np.stack((r, g, b), axis=1).astype(np.float32)
+
+
+def density_to_visuals(density: np.ndarray):
+    """Convert local density to marker color and size for depth-rich rendering."""
+    lo, hi = np.percentile(density, [5.0, 95.0])
+    if (not np.isfinite(lo)) or (not np.isfinite(hi)) or (hi - lo < 1e-8):
+        t = np.zeros_like(density, dtype=np.float32)
+    else:
+        t = np.clip((density - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+
+    # Smoothstep enhances contrast without harsh banding.
+    t = t * t * (3.0 - 2.0 * t)
+
+    rgb = heat_colormap(t)
+    alpha = (0.08 + 0.20 * t).astype(np.float32)
+    colors = np.column_stack((rgb, alpha)).astype(np.float32)
+    sizes = np.full(density.shape, 2.2, dtype=np.float32)
+    return colors, sizes
+
+# ---------------------------------------------------------------------------
 # VisPy real-time renderer
 # ---------------------------------------------------------------------------
 class MDCanvas:
@@ -394,10 +509,14 @@ class MDCanvas:
             keys="interactive", size=(1024, 768), show=True,
             title="Fe-C Molecular Dynamics"
         )
+        self.canvas.bgcolor = (0.02, 0.03, 0.07, 1.0)
         self.view = self.canvas.central_widget.add_view()
         self.view.camera = scene.cameras.TurntableCamera(
             distance=box_size * 1.8, fov=70, translate_speed=10.0
         )
+        self.view.camera.center = (box_size * 0.5, box_size * 0.5, box_size * 0.5)
+        self.view.camera.azimuth = 38.0
+        self.view.camera.elevation = 28.0
 
         # 2) Create ModernGL context from VisPy's active GL context
         ctx = moderngl.create_context(require=430)
@@ -412,16 +531,16 @@ class MDCanvas:
         print(f"Cell grid: {self.gpu['n_cells_1d']}³ = {self.gpu['n_cells_total']} cells  "
               f"(cell size = {self.gpu['box_size']/self.gpu['n_cells_1d']:.2f} Å, r_cut = {R_CUT:.2f} Å)")
 
-        # 5) Set up scatter plot from numpy data (no GPU read needed)
-        colors = np.where(
-            types[:, None] == 0,
-            np.array([0.75, 0.75, 0.78, 1.0]),
-            np.array([0.25, 0.25, 0.25, 1.0]),
-        )
+        # 5) Set up density-based 3D heat-map style
+        self.box_size = box_size
+        self.heat_grid_size = max(20, self.gpu["n_cells_1d"] * 4)
+        init_density = compute_density_samples(init_pos[:, :3], box_size,
+                                               self.heat_grid_size)
+        colors, sizes = density_to_visuals(init_density)
 
         self.scatter = visuals.Markers(scaling=True)
         self.scatter.set_data(
-            init_pos[:, :3], face_color=colors, size=1.0, edge_width=0
+            init_pos[:, :3], face_color=colors, size=sizes, edge_width=0
         )
         self.view.add(self.scatter)
 
@@ -444,6 +563,7 @@ class MDCanvas:
             self.view.add(edge)
 
         self.colors = colors
+        self.sizes = sizes
         self.timer = app.Timer(interval=0.001, connect=self.on_timer, start=True)
 
     def on_timer(self, event):
@@ -451,7 +571,9 @@ class MDCanvas:
         self.step_count += 1
 
         pos = read_positions(self.gpu)[:, :3]
-        self.scatter.set_data(pos, face_color=self.colors, size=0.8, edge_width=0)
+        density = compute_density_samples(pos, self.box_size, self.heat_grid_size)
+        self.colors, self.sizes = density_to_visuals(density)
+        self.scatter.set_data(pos, face_color=self.colors, size=self.sizes, edge_width=0)
 
         # Velocity-rescaling thermostat every step
         vel = read_velocities(self.gpu)
